@@ -19,6 +19,16 @@ private:
 	void Hide();
 	void DisconnectTarget();
 
+	// Keep-alive: DWM freezes a thumbnail while its source is minimized, so a source that
+	// gets minimized is parked off-screen (not minimized) and moved back when it's activated.
+	void Hook();
+	void Unhook();
+	void ParkTarget();
+	void UnparkTarget();
+	void OnTargetMinimizeStart();
+	void OnTargetForeground();
+	static void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD eventThread, DWORD eventTime);
+
 private:
 	HWND m_currentTarget = nullptr;
 	POINT m_previousPosition = {};
@@ -26,6 +36,14 @@ private:
 	unique_hthumbnail m_thumbnail;
 	RECT m_destRect = {};
 	RECT m_sourceRect = {};
+
+	HWINEVENTHOOK m_minimizeHook = nullptr;
+	HWINEVENTHOOK m_foregroundHook = nullptr;
+	HWINEVENTHOOK m_destroyHook = nullptr;
+	WINDOWPLACEMENT m_savedPlacement = {};
+	bool m_targetParked = false;
+	bool m_suppressMinimizeHook = false; // Set while we minimize the target ourselves
+	bool m_minimized = false;
 
 	bool m_destroyed = false;
 	std::function<void(HWND)> m_closedCallback;

@@ -1,8 +1,15 @@
 #include "pch.h"
 #include "ThumbnailCropAndLockWindow.h"
 
+#include <map>
+
 const std::wstring ThumbnailCropAndLockWindow::ClassName = L"CropAndLock.ThumbnailCropAndLockWindow";
 std::once_flag ThumbnailCropAndLockWindowClassRegistration;
+
+// Distance past the right edge of all displays where a parked target is placed
+const LONG ParkedOffscreenMargin = 100;
+// WinEvent hook handle -> the window that installed it
+std::map<HWINEVENTHOOK, ThumbnailCropAndLockWindow*> winEventHookOwners;
 
 float ComputeScaleFactor(RECT const& windowRect, RECT const& contentRect)
 {
@@ -98,6 +105,26 @@ LRESULT ThumbnailCropAndLockWindow::MessageHandler(UINT const message, WPARAM co
     case WM_SIZE:
     case WM_SIZING:
     {
+        if (message == WM_SIZE && wparam == SIZE_MINIMIZED)
+        {
+            // Minimize the target too, without letting the keep-alive hook park it.
+            if (m_currentTarget != nullptr && IsWindow(m_currentTarget) && !IsIconic(m_currentTarget))
+            {
+                m_suppressMinimizeHook = true;
+                ShowWindow(m_currentTarget, SW_SHOWMINNOACTIVE);
+            }
+            m_minimized = true;
+            break;
+        }
+
+        if (message == WM_SIZE && m_minimized)
+        {
+            // Restored from minimized: put the target back where it keeps the thumbnail alive.
+            m_minimized = false;
+            m_suppressMinimizeHook = false;
+            ParkTarget();
+        }
+
         if (m_thumbnail != nullptr)
         {
             RECT clientRect = {};
@@ -163,6 +190,150 @@ void ThumbnailCropAndLockWindow::CropAndLock(HWND windowToCrop, RECT cropRect)
     properties.rcDestination = m_destRect;
     properties.rcSource = m_sourceRect;
     winrt::check_hresult(DwmUpdateThumbnailProperties(m_thumbnail.get(), &properties));
+
+    Hook();
+}
+
+void ThumbnailCropAndLockWindow::Hook()
+{
+    Unhook();
+
+    DWORD processId = 0;
+    auto threadId = GetWindowThreadProcessId(m_currentTarget, &processId);
+
+    m_minimizeHook = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZESTART, nullptr, WinEventProc, processId, threadId, WINEVENT_OUTOFCONTEXT);
+    m_foregroundHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, WinEventProc, processId, threadId, WINEVENT_OUTOFCONTEXT);
+    m_destroyHook = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY, nullptr, WinEventProc, processId, threadId, WINEVENT_OUTOFCONTEXT);
+    if (m_minimizeHook == nullptr || m_foregroundHook == nullptr || m_destroyHook == nullptr)
+    {
+        Logger::warn(L"Failed to hook the target window events, the thumbnail won't stay live when it is minimized or close when the target is destroyed.");
+    }
+    for (auto* hook : { &m_minimizeHook, &m_foregroundHook, &m_destroyHook })
+    {
+        if (*hook != nullptr)
+        {
+            winEventHookOwners[*hook] = this;
+        }
+    }
+}
+
+void ThumbnailCropAndLockWindow::Unhook()
+{
+    for (auto* hook : { &m_minimizeHook, &m_foregroundHook, &m_destroyHook })
+    {
+        if (*hook != nullptr)
+        {
+            winEventHookOwners.erase(*hook);
+            UnhookWinEvent(*hook);
+            *hook = nullptr;
+        }
+    }
+}
+
+void CALLBACK ThumbnailCropAndLockWindow::WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG idObject, LONG idChild, DWORD /*eventThread*/, DWORD /*eventTime*/)
+{
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF)
+    {
+        return;
+    }
+
+    auto owner = winEventHookOwners.find(hook);
+    if (owner == winEventHookOwners.end() || owner->second->m_currentTarget != hwnd)
+    {
+        return;
+    }
+
+    if (event == EVENT_SYSTEM_MINIMIZESTART)
+    {
+        owner->second->OnTargetMinimizeStart();
+    }
+    else if (event == EVENT_SYSTEM_FOREGROUND)
+    {
+        owner->second->OnTargetForeground();
+    }
+    else if (event == EVENT_OBJECT_DESTROY)
+    {
+        // Post instead of destroying here, we're inside the hook callback.
+        PostMessageW(owner->second->m_window, WM_CLOSE, 0, 0);
+    }
+}
+
+void ThumbnailCropAndLockWindow::OnTargetMinimizeStart()
+{
+    if (m_suppressMinimizeHook)
+    {
+        m_suppressMinimizeHook = false;
+        return;
+    }
+    ParkTarget();
+}
+
+void ThumbnailCropAndLockWindow::OnTargetForeground()
+{
+    UnparkTarget();
+}
+
+void ThumbnailCropAndLockWindow::ParkTarget()
+{
+    if (m_currentTarget == nullptr || !IsWindow(m_currentTarget))
+    {
+        return;
+    }
+
+    if (!m_targetParked)
+    {
+        WINDOWPLACEMENT placement = { sizeof(placement) };
+        if (!GetWindowPlacement(m_currentTarget, &placement))
+        {
+            return;
+        }
+        // A minimized window reports SW_SHOWMINIMIZED, work out what it restores to.
+        if (placement.showCmd == SW_SHOWMINIMIZED)
+        {
+            placement.showCmd = (placement.flags & WPF_RESTORETOMAXIMIZED) ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+        }
+        placement.flags = 0;
+        m_savedPlacement = placement;
+    }
+
+    // Restore the target to a normal (not minimized) window outside every monitor.
+    auto displaysRect = ComputeAllDisplaysUnion();
+    auto width = m_savedPlacement.rcNormalPosition.right - m_savedPlacement.rcNormalPosition.left;
+    auto height = m_savedPlacement.rcNormalPosition.bottom - m_savedPlacement.rcNormalPosition.top;
+    auto left = displaysRect.right + ParkedOffscreenMargin;
+    auto top = displaysRect.top;
+
+    WINDOWPLACEMENT parked = m_savedPlacement;
+    parked.showCmd = SW_SHOWNOACTIVATE;
+    parked.rcNormalPosition = { left, top, left + width, top + height };
+    if (!SetWindowPlacement(m_currentTarget, &parked))
+    {
+        return;
+    }
+    m_targetParked = true;
+
+    // Make sure it didn't get moved back on screen (placement coordinates are in workspace space).
+    RECT actualRect = {};
+    RECT overlap = {};
+    if (GetWindowRect(m_currentTarget, &actualRect) && IntersectRect(&overlap, &actualRect, &displaysRect))
+    {
+        SetWindowPos(m_currentTarget, nullptr, left, top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+void ThumbnailCropAndLockWindow::UnparkTarget()
+{
+    if (!m_targetParked)
+    {
+        return;
+    }
+    m_targetParked = false;
+
+    // The target may already be gone (that's why we could be closing).
+    if (m_currentTarget != nullptr && IsWindow(m_currentTarget))
+    {
+        SetWindowPlacement(m_currentTarget, &m_savedPlacement);
+    }
 }
 
 void ThumbnailCropAndLockWindow::Hide()
@@ -175,6 +346,9 @@ void ThumbnailCropAndLockWindow::DisconnectTarget()
 {
     if (m_currentTarget != nullptr)
     {
+        UnparkTarget();
+        Unhook();
+        m_suppressMinimizeHook = false;
         m_thumbnail.reset();
         m_currentTarget = nullptr;
     }
